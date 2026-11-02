@@ -78,6 +78,26 @@ Save the config — OpenCode hot-reloads plugins, or run `/reload`.
 | `prompt`  | No       | built-in | Analysis prompt sent to the vision model |
 | `timeout` | No       | `120000` | Base timeout in ms for one vision request; scales up with image size up to `300000` |
 | `debug`   | No       | `false`  | Write diagnostic events to `<tmpdir>/iv-debug.log` |
+| `text_only_models` | No | `[]` | Model ids always treated as text-only, overriding registry metadata that wrongly claims image input |
+
+Use `text_only_models` when a provider's own API is stricter than OpenCode's
+catalog data. Example: the `intern` registry may advertise image input for a
+model that only accepts text — add its id here to make the plugin transform
+its conversations again:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "file:///home/<you>/.config/opencode/plugins/image-vision",
+      "options": {
+        "model": "amd/MiniCPM-V-4.7-1B",
+        "text_only_models": ["Atria-Dawn"]
+      }
+    }
+  ]
+}
+```
 
 Debug can also be enabled with the `IMAGE_VISION_DEBUG=1` environment variable (`IMAGE_VISION_DEBUG_PATH` overrides the log path).
 
