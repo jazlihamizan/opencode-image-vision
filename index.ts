@@ -135,6 +135,12 @@ interface PluginOptions {
   timeout?: number
   /** Write diagnostic events to the debug log. */
   debug?: boolean
+  /**
+   * Model ids always treated as text-only, even when the model registry
+   * (e.g. catalog metadata) claims image input. Use this when a provider's
+   * own API is stricter than OpenCode's registry.
+   */
+  text_only_models?: string[]
 }
 
 export default Plugin.define({
@@ -155,6 +161,7 @@ export default Plugin.define({
     const visionModel = { providerID: model.slice(0, slashIdx), modelID: model.slice(slashIdx + 1) }
     const analysisPrompt = options.prompt || DEFAULT_PROMPT
     const baseTimeout = options.timeout ?? 120000
+    const forceTextOnly = new Set((options.text_only_models ?? []).map(id => id.toLowerCase()))
 
     dbg(() => ({ event: "server_init_ok", model, visionModel }))
 
@@ -213,7 +220,7 @@ export default Plugin.define({
         const activeModelId = (event as any)?.model?.id
         dbg(() => ({ event: "gate_model", activeModelId, visionModel }))
         if (activeModelId && activeModelId === visionModel.modelID) return
-        if (activeModelId && visionCapable.has(activeModelId)) {
+        if (activeModelId && visionCapable.has(activeModelId) && !forceTextOnly.has(activeModelId.toLowerCase())) {
           dbg(() => ({ event: "skip_vision_capable_model", activeModelId }))
           return
         }
