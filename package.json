@@ -1,6 +1,6 @@
 {
   "name": "@jazlihamizan/opencode-image-vision",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "OpenCode v2 plugin that gives text-only models the ability to understand pasted images by routing them to a vision model",
   "type": "module",
   "license": "MIT",

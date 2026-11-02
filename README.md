@@ -20,6 +20,25 @@ When an image is attached to a conversation, the plugin replaces it with a short
 
 The plugin automatically skips transformation when the active model already accepts image input, so it never double-processes a conversation running on a vision-capable model.
 
+## Performance
+
+Three mechanisms keep image analysis fast:
+
+1. **Dedicated lightweight agent** — vision requests run in a child session under a hidden, tool-free agent pinned to the vision model, so they never load the default agent's large system prompt.
+2. **Parallel prefetch** — the moment a prompt with image attachments is submitted, analysis starts in the background. Vision latency overlaps with the main model's reasoning, so the result is usually ready before the model calls `analyze_image`.
+3. **Content-hash cache** — identical pictures are analyzed once per server run; repeat calls return in ~1ms.
+
+Measured with `amd/MiniCPM-V-4.7-1B` on a 640×400 form screenshot (Atria-Dawn as the text-only model):
+
+| Path | Latency |
+| ---- | ------- |
+| v1 plugin (OpenCode 1, `@showlotus/opencode-image-vision`) | ~22.8s |
+| v2.0 plugin baseline (child session with the default agent) | 10.4s |
+| v2.1 fresh analysis (dedicated agent + tight prompt) | 2.7–2.8s |
+| v2.1 repeat image (cache hit) | ~1–4ms |
+
+Multi-image turns analyze all pictures in parallel, and duplicate images within one turn are deduped.
+
 ## Requirements
 
 - **OpenCode v2.2 or newer** (uses the v2 plugin API — it will not load on OpenCode v1)
@@ -79,6 +98,8 @@ Save the config — OpenCode hot-reloads plugins, or run `/reload`.
 | `timeout` | No       | `120000` | Base timeout in ms for one vision request; scales up with image size up to `300000` |
 | `debug`   | No       | `false`  | Write diagnostic events to `<tmpdir>/iv-debug.log` |
 | `text_only_models` | No | `[]` | Model ids always treated as text-only, overriding registry metadata that wrongly claims image input |
+| `prefetch` | No | `true` | Analyze images in parallel the moment a prompt is submitted, overlapping vision latency with the main model's reasoning |
+| `max_tokens` | No | `256` | Maximum output tokens for one vision description |
 
 Use `text_only_models` when a provider's own API is stricter than OpenCode's
 catalog data. Example: the `intern` registry may advertise image input for a

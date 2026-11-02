@@ -2,14 +2,19 @@
  * opencode-image-vision — OpenCode v2 plugin
  *
  * Gives text-only models the ability to understand pasted images.
- * When a user attaches an image, the media part in the model context is
- * replaced with a text instruction that calls the `analyze_image` tool.
- * The tool spawns a child session against a vision model, sends the image,
- * and returns the text description to the main session.
+ * When a user attaches an image, the plugin replaces it with a short text
+ * instruction and registers an `analyze_image` tool. The tool sends the image
+ * to a separate vision model and returns a detailed text description.
+ *
+ * v2.1 performance architecture:
+ *  - A dedicated lightweight agent (no tools) runs the vision request, so the
+ *    child session never loads the full build-agent system prompt.
+ *  - A `prompt` hook prefetches image analysis in parallel the moment the
+ *    user submits a message, overlapping vision latency with the main
+ *    model's reasoning.
  *
  * Ported from the v1 plugin @showlotus/opencode-image-vision (MIT) to the
- * OpenCode v2 plugin API (Plugin.define + ctx.session.hook("context") +
- * ctx.tool.transform).
+ * OpenCode v2 plugin API.
  *
  * License: MIT
  */
@@ -27,10 +32,12 @@ import { join, extname, resolve, sep } from "node:path"
 const TEMP_DIR = join(tmpdir(), "iv-images")
 const DEBUG_LOG = process.env.IMAGE_VISION_DEBUG_PATH || join(tmpdir(), "iv-debug.log")
 
+const AGENT_ID = "image-vision-analyst"
+
 const DEFAULT_PROMPT = [
-  "Describe this image in detail, including:",
-  "text content, UI layout structure, interface elements, color scheme.",
-  "If there are code or technical details, list them thoroughly.",
+  "Describe this image concisely but completely. Use short Markdown.",
+  "Cover: text content (transcribe exactly), UI layout, key elements, colors.",
+  "Include code or technical details when present. No preamble.",
 ].join(" ")
 
 const MIME_TO_EXT: Record<string, string> = {
@@ -122,6 +129,12 @@ function formatElapsed(ms: number) {
   return `${m}m ${s}s`
 }
 
+/** Fetch a data: URI into bytes, or null when not decodable. */
+function decodeDataUri(uri: string): { base64: string; mime: string } | null {
+  const match = uri?.match?.(/^data:([^;]+);base64,(.+)$/)
+  return match ? { base64: match[2], mime: match[1] || "image/png" } : null
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -137,10 +150,13 @@ interface PluginOptions {
   debug?: boolean
   /**
    * Model ids always treated as text-only, even when the model registry
-   * (e.g. catalog metadata) claims image input. Use this when a provider's
-   * own API is stricter than OpenCode's registry.
+   * (e.g. catalog metadata) claims image input.
    */
   text_only_models?: string[]
+  /** Analyze images in parallel when the user submits a prompt (default true). */
+  prefetch?: boolean
+  /** Maximum output tokens for one vision description (default 256). */
+  max_tokens?: number
 }
 
 export default Plugin.define({
@@ -162,10 +178,10 @@ export default Plugin.define({
     const analysisPrompt = options.prompt || DEFAULT_PROMPT
     const baseTimeout = options.timeout ?? 120000
     const forceTextOnly = new Set((options.text_only_models ?? []).map(id => id.toLowerCase()))
+    const prefetchEnabled = options.prefetch !== false
+    const maxTokens = options.max_tokens ?? 256
 
-    dbg(() => ({ event: "server_init_ok", model, visionModel }))
-
-    const cleanupTasks: Array<() => void> = []
+    dbg(() => ({ event: "server_init_ok", model, visionModel, prefetchEnabled, maxTokens }))
 
     // ---------------- shared state ----------------
     const cache = new Map<string, string>()
@@ -174,13 +190,15 @@ export default Plugin.define({
       pendingFilePaths: [] as string[],
       pendingSessionId: null as string | null,
       processingHashes: new Set<string>(),
+      /** Prefetched descriptions ready for the tool to consume. */
+      prefetched: new Map<string, string>(),
+      /** Prefetch promises in flight, keyed by image hash. */
+      inflight: new Map<string, Promise<string>>(),
     }
 
-    /**
-     * Models that already accept image input. The context hook is skipped for
-     * these so the plugin never double-processes a vision-capable model.
-     * Preloaded once at setup and refreshed when the model catalog changes.
-     */
+    const cleanupTasks: Array<() => void> = []
+
+    // ---------------- model capability gate ----------------
     const visionCapable = new Set<string>()
     const refreshVisionCapable = async () => {
       try {
@@ -206,12 +224,150 @@ export default Plugin.define({
           await refreshVisionCapable()
         }
       })()
-      // Keep the subscription alive for the plugin lifetime; cleanup aborts it.
-      // @ts-expect-error attach cleanup
       cleanupTasks.push(() => controller.abort())
     } catch {}
 
+    // ---------------- dedicated lightweight agent ----------------
+    // The vision child session runs under this agent so it never loads the
+    // default build agent's large system prompt or tool registry.
+    const analyst: any = {
+      id: AGENT_ID,
+      name: "Image Vision Analyst",
+      description: "Describes images for text-only models. Invoked by the image-vision plugin.",
+      mode: "subagent",
+      hidden: true,
+      model: { providerID: visionModel.providerID, id: visionModel.modelID },
+      system: analysisPrompt,
+      request: { settings: {}, headers: {}, body: {} },
+      permissions: [],
+      steps: 1,
+    }
+    await ctx.agent.transform((editor) => {
+      editor.update(AGENT_ID, () => {
+        // copy definition fields onto the mutable draft
+        const draft = editor as any
+        for (const key of Object.keys(analyst)) draft[key] = analyst[key]
+      })
+    })
+
+    // ---------------- core analysis routine ----------------
+    /**
+     * Analyze one image (base64) against the vision model and return its
+     * description. Cached by content hash; concurrent calls for the same
+     * hash share one in-flight promise.
+     */
+    const analyzeBase64 = async (base64: string, mime: string): Promise<string> => {
+      const hash = createHash("md5").update(base64).digest("hex").slice(0, 16)
+      const cached = cache.get(hash)
+      if (cached) {
+        dbg(() => ({ event: "cache_hit", hash }))
+        return cached
+      }
+      const existing = state.inflight.get(hash)
+      if (existing) return existing
+
+      const promise = (async () => {
+        let childId: string | undefined
+        try {
+          const child = (await ctx.session.create({
+            title: "Vision Analysis",
+            agent: AGENT_ID,
+            model: { providerID: visionModel.providerID, id: visionModel.modelID },
+          } as any)) as any
+          childId = child?.sessionID ?? child?.id
+          if (!childId) throw new Error("Failed to create child session")
+
+          const computedTimeout = computeTimeoutBySize(base64.length, baseTimeout)
+          const controller = new AbortController()
+          const timeoutId = setTimeout(() => controller.abort(new Error("Vision API timeout")), computedTimeout)
+
+          try {
+            await ctx.session.prompt({
+              sessionID: childId,
+              text: analysisPrompt,
+              files: [{ uri: `data:${mime};base64,${base64}`, name: "image", description: "Image to analyze" }],
+            } as any)
+
+            const cancelled = new Promise<void>((_, reject) => {
+              controller.signal.addEventListener("abort", () => reject(new Error("Cancelled")), { once: true })
+            })
+            await Promise.race([ctx.session.wait({ sessionID: childId } as any), cancelled])
+
+            const history = (await ctx.session.context({ sessionID: childId } as any)) as any[]
+            const msgs = Array.isArray(history) ? history : history?.messages ?? []
+            let desc: string | null = null
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              const m = msgs[i]
+              if (m?.type !== "assistant") continue
+              const textPart = (m.content ?? []).find((p: any) => p?.type === "text")
+              if (textPart?.text) {
+                desc = textPart.text
+                break
+              }
+            }
+            clearTimeout(timeoutId)
+
+            const final = (desc ?? "").trim() || "[No description returned]"
+            cache.set(hash, final)
+            state.prefetched.set(hash, final)
+            dbg(() => ({ event: "analyze_ok", hash, descLen: final.length }))
+            return final
+          } finally {
+            clearTimeout(timeoutId)
+          }
+        } finally {
+          state.inflight.delete(hash)
+          if (childId) {
+            try {
+              await ctx.session.remove({ sessionID: childId } as any)
+            } catch {}
+          }
+        }
+      })()
+      state.inflight.set(hash, promise)
+      return promise
+    }
+
+    // ---------------- prompt hook: parallel prefetch ----------------
+    // Fires the moment the user submits a message with image attachments,
+    // so vision latency overlaps with the main model's reasoning.
+    if (prefetchEnabled) {
+      await ctx.session.hook("prompt", (event) => {
+        try {
+          const files = ((event as any)?.prompt?.files ?? []) as Array<{ uri?: string }>
+          for (const f of files) {
+            const uri = f?.uri ?? ""
+            let decoded: { base64: string; mime: string } | null = null
+            if (uri.startsWith("data:")) {
+              decoded = decodeDataUri(uri)
+            } else if (uri.startsWith("file://")) {
+              const filePath = decodeURIComponent(uri.slice("file://".length))
+              if (!isPathAllowed(filePath)) continue
+              try {
+                const buffer = readFileSync(filePath)
+                decoded = { base64: buffer.toString("base64"), mime: guessMimeFromExt(extname(filePath)) }
+              } catch {
+                continue
+              }
+            }
+            if (!decoded) continue
+            const hash = createHash("md5").update(decoded.base64).digest("hex").slice(0, 16)
+            if (cache.has(hash) || state.inflight.has(hash)) continue
+            dbg(() => ({ event: "prefetch_start", hash }))
+            void analyzeBase64(decoded.base64, decoded.mime).catch(e => {
+              dbg(() => ({ event: "prefetch_failed", hash, error: e.message }))
+            })
+          }
+        } catch (e: any) {
+          dbg(() => ({ event: "prefetch_hook_error", error: e.message }))
+        }
+      })
+    }
+
     // ---------------- context hook ----------------
+    // Replaces the v1 "experimental.chat.messages.transform" hook.
+    // event.messages is Message[] (@opencode/ai/effect), each { role, content: ContentPart[] }.
+    // An image is a part { type: "media", media: { source: { type: "base64", data, mediaType } } }.
     await ctx.session.hook("context", (event) => {
       try {
         const messages = (event.messages as any[]) ?? []
@@ -310,101 +466,39 @@ export default Plugin.define({
 
           dbg(() => ({ event: "execute_paths", argsPath: input?.file_path, pendingCount: state.pendingFilePaths.length }))
 
-          const results: string[] = []
-          let analyzedCount = 0
+          // Analyze all images in parallel; each is cached/deduped by hash.
+          const results = await Promise.all(
+            filePaths.map(async filePath => {
+              if (!isPathAllowed(filePath)) return "[Analysis failed: path not allowed]"
 
-          for (const filePath of filePaths) {
-            if (!isPathAllowed(filePath)) {
-              results.push("[Analysis failed: path not allowed]")
-              continue
-            }
+              let base64: string, mime: string
+              try {
+                const buffer = readFileSync(filePath)
+                base64 = buffer.toString("base64")
+                mime = guessMimeFromExt(extname(filePath))
+              } catch (e: any) {
+                const msg = `[Analysis failed: cannot read file ${filePath}: ${e.message}]`
+                dbg(() => ({ event: "tool_analyze_fail", error: e.message }))
+                return msg
+              }
 
-            let base64: string, mime: string
-            try {
-              const buffer = readFileSync(filePath)
-              base64 = buffer.toString("base64")
-              mime = guessMimeFromExt(extname(filePath))
-            } catch (e: any) {
-              results.push(`[Analysis failed: cannot read file ${filePath}: ${e.message}]`)
-              dbg(() => ({ event: "tool_analyze_fail", error: e.message }))
-              continue
-            }
-
-            const hash = createHash("md5").update(base64).digest("hex").slice(0, 16)
-            if (cache.has(hash)) {
-              results.push(cache.get(hash) as string)
-              continue
-            }
-            if (state.processingHashes.has(hash)) {
-              results.push(
-                "[This image is currently being analyzed. Please wait for the existing analysis to complete.]",
-              )
-              continue
-            }
-            state.processingHashes.add(hash)
-
-            let childId: string | undefined
-            try {
-              // Child session pinned to the configured vision model
-              const child = (await ctx.session.create({
-                title: "Vision Analysis",
-                model: { providerID: visionModel.providerID, id: visionModel.modelID },
-              } as any)) as any
-              childId = child?.sessionID ?? child?.id
-              if (!childId) throw new Error("Failed to create child session")
-
-              const computedTimeout = computeTimeoutBySize(base64.length, baseTimeout)
-              const controller = new AbortController()
-              const timeoutId = setTimeout(() => controller.abort(new Error("Vision API timeout")), computedTimeout)
+              const hash = createHash("md5").update(base64).digest("hex").slice(0, 16)
+              const prefetched = state.prefetched.get(hash)
+              if (prefetched) {
+                dbg(() => ({ event: "prefetch_used", hash }))
+                state.prefetched.delete(hash)
+                return prefetched
+              }
+              if (cache.has(hash)) return cache.get(hash) as string
 
               try {
-                await ctx.session.prompt({
-                  sessionID: childId,
-                  text: analysisPrompt,
-                  files: [{ uri: `data:${mime};base64,${base64}`, name: "image", description: "Image to analyze" }],
-                } as any)
-
-                // Wait for the child session to finish; cancel on timeout or tool abort
-                const cancelSignal = context?.signal
-                const cancelled = new Promise<void>((_, reject) => {
-                  cancelSignal?.addEventListener?.("abort", () => reject(new Error("Cancelled")), { once: true })
-                })
-                await Promise.race([ctx.session.wait({ sessionID: childId } as any), cancelled])
-
-                const history = (await ctx.session.context({ sessionID: childId } as any)) as any[]
-                const msgs = Array.isArray(history) ? history : history?.messages ?? []
-                let desc: string | null = null
-                for (let i = msgs.length - 1; i >= 0; i--) {
-                  const m = msgs[i]
-                  if (m?.type !== "assistant") continue
-                  const textPart = (m.content ?? []).find((p: any) => p?.type === "text")
-                  if (textPart?.text) {
-                    desc = textPart.text
-                    break
-                  }
-                }
-                clearTimeout(timeoutId)
-
-                const final = (desc ?? "").trim() || "[No description returned]"
-                cache.set(hash, final)
-                results.push(final)
-                analyzedCount++
-                dbg(() => ({ event: "tool_analyze_ok", descLen: final.length }))
-              } finally {
-                clearTimeout(timeoutId)
+                return await analyzeBase64(base64, mime)
+              } catch (e: any) {
+                dbg(() => ({ event: "tool_analyze_fail", error: e.message }))
+                return `[Analysis failed: ${e.message}]`
               }
-            } catch (e: any) {
-              results.push(`[Analysis failed: ${e.message}]`)
-              dbg(() => ({ event: "tool_analyze_fail", error: e.message }))
-            } finally {
-              state.processingHashes.delete(hash)
-              if (childId) {
-                try {
-                  await ctx.session.remove({ sessionID: childId } as any)
-                } catch {}
-              }
-            }
-          }
+            }),
+          )
 
           if (!input?.file_path) state.pendingFilePaths = []
           if (state.pendingFilePaths.length === 0) {
@@ -413,19 +507,14 @@ export default Plugin.define({
           }
 
           const elapsed = Date.now() - startTime
+          const analyzedCount = results.filter(r => !r.startsWith("[Analysis failed")).length
           dbg(() => ({ event: "tool_complete", count: results.length, analyzedCount, elapsedMs: elapsed }))
           const output =
             results.length === 1
               ? results[0]
               : results.map((desc, i) => `### Image ${i + 1}\n\n${desc}`).join("\n\n---\n\n")
           if (analyzedCount > 0) {
-            const hasFail = results.some(r => r.includes("[Analysis failed"))
-            dbg(() => ({
-              event: "tool_summary",
-              analyzed: analyzedCount,
-              elapsed: formatElapsed(elapsed),
-              hasFail,
-            }))
+            dbg(() => ({ event: "tool_summary", analyzed: analyzedCount, elapsed: formatElapsed(elapsed) }))
           }
           return { content: output }
         },
