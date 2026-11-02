@@ -1,0 +1,39 @@
+{
+  "name": "@jazlihamizan/opencode-image-vision",
+  "version": "2.0.0",
+  "description": "OpenCode v2 plugin that gives text-only models the ability to understand pasted images by routing them to a vision model",
+  "type": "module",
+  "license": "MIT",
+  "author": "jazlihamizan",
+  "homepage": "https://github.com/jazlihamizan/opencode-image-vision",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jazlihamizan/opencode-image-vision.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jazlihamizan/opencode-image-vision/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "vision",
+    "image-analysis",
+    "llm",
+    "accessibility",
+    "multimodal"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.1"
+  }
+}
